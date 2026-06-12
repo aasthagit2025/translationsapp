@@ -1,25 +1,20 @@
+import streamlit as st
 import pandas as pd
 import re
+import io
+
 from docx import Document
 from rapidfuzz import fuzz
-from collections import defaultdict
 
-##########################################################
+# =====================================================
 # CONFIG
-##########################################################
+# =====================================================
 
-SAWTOOTH_FILE = r"Input/Sawtooth_Export.xlsx"
-WORD_FILE = r"Input/QRE_Translated.docx"
+FUZZY_THRESHOLD = 92
 
-OUTPUT_FILE = r"Output/Translated_Output.xlsx"
-UNMATCHED_FILE = r"Output/Unmatched.xlsx"
-REPORT_FILE = r"Output/Translation_Report.xlsx"
-
-FUZZY_THRESHOLD = 95
-
-##########################################################
-# TEXT CLEANER
-##########################################################
+# =====================================================
+# HELPERS
+# =====================================================
 
 def normalize_text(text):
 
@@ -33,9 +28,8 @@ def normalize_text(text):
 
     text = re.sub(r"\s+", " ", text)
 
-    text = text.strip()
+    return text.strip()
 
-    return text
 
 def clean_for_match(text):
 
@@ -45,43 +39,21 @@ def clean_for_match(text):
 
     text = re.sub(r"[^\w\s]", "", text)
 
-    return text
+    return text.strip()
 
-##########################################################
-# QUESTION ID EXTRACTOR
-##########################################################
 
-def extract_qid(id_text):
+def contains_latin(text):
 
-    if pd.isna(id_text):
-        return None
+    return bool(re.search(r"[A-Za-z]", str(text)))
 
-    id_text = str(id_text)
 
-    patterns = [
+# =====================================================
+# DOCX READER
+# =====================================================
 
-        r"'([A-Z]+\d+[a-zA-Z]*)List'",
-        r"'([A-Z]+\d+[a-zA-Z]*)Grid'",
-        r"'([A-Z]+\d+[a-zA-Z]*)Question'",
-        r"'([A-Z]+\d+[a-zA-Z]*)'",
-    ]
+def read_docx_content(uploaded_docx):
 
-    for p in patterns:
-
-        m = re.search(p, id_text)
-
-        if m:
-            return m.group(1)
-
-    return None
-
-##########################################################
-# READ DOCX
-##########################################################
-
-def read_docx_content(doc_path):
-
-    doc = Document(doc_path)
+    doc = Document(uploaded_docx)
 
     content = []
 
@@ -107,48 +79,64 @@ def read_docx_content(doc_path):
 
     return content
 
-##########################################################
-# BUILD TRANSLATION PAIRS
-##########################################################
+
+# =====================================================
+# TRANSLATION DICTIONARY
+# =====================================================
 
 def build_translation_dictionary(content):
 
     translations = {}
 
-    for i in range(len(content)-1):
+    for i in range(len(content) - 1):
 
-        en = content[i]
-        tr = content[i+1]
+        current = normalize_text(content[i])
+        nxt = normalize_text(content[i + 1])
 
-        if en == tr:
+        if not current:
             continue
 
-        if len(en) < 2:
+        if not nxt:
             continue
 
-        if len(tr) < 2:
+        if current == nxt:
             continue
 
-        key = clean_for_match(en)
+        if len(current) < 2:
+            continue
 
-        if key not in translations:
+        if len(nxt) < 2:
+            continue
 
-            translations[key] = tr
+        if current.isnumeric():
+            continue
+
+        if nxt.isnumeric():
+            continue
+
+        if contains_latin(current):
+
+            key = clean_for_match(current)
+
+            if key not in translations:
+
+                translations[key] = nxt
 
     return translations
 
-##########################################################
-# FUZZY LOOKUP
-##########################################################
 
-def fuzzy_lookup(source, translation_dict):
+# =====================================================
+# FUZZY MATCH
+# =====================================================
+
+def fuzzy_lookup(source_key, translation_dict):
 
     best_score = 0
     best_translation = ""
 
     for k, v in translation_dict.items():
 
-        score = fuzz.ratio(source, k)
+        score = fuzz.ratio(source_key, k)
 
         if score > best_score:
 
@@ -161,197 +149,286 @@ def fuzzy_lookup(source, translation_dict):
 
     return ""
 
-##########################################################
-# LOAD WORD QRE
-##########################################################
 
-print("Reading Word file...")
+# =====================================================
+# STREAMLIT UI
+# =====================================================
 
-content = read_docx_content(WORD_FILE)
-
-translation_dict = build_translation_dictionary(content)
-
-print(
-    f"Translation pairs extracted: "
-    f"{len(translation_dict)}"
+st.set_page_config(
+    page_title="Survey Translation Tool",
+    layout="wide"
 )
 
-##########################################################
-# LOAD SAWTOOTH EXPORT
-##########################################################
+st.title("Survey Translation Automation Tool")
 
-print("Reading Sawtooth export...")
+st.markdown(
+    "Upload Sawtooth Export and translated Word questionnaire."
+)
 
-df = pd.read_excel(SAWTOOTH_FILE)
+uploaded_excel = st.file_uploader(
+    "Upload Sawtooth Export (.xlsx)",
+    type=["xlsx"]
+)
 
-##########################################################
-# DETECT COLUMNS
-##########################################################
+uploaded_docx = st.file_uploader(
+    "Upload Translated Questionnaire (.docx)",
+    type=["docx"]
+)
 
-id_col = None
-source_col = None
-target_col = None
+# =====================================================
+# PROCESS
+# =====================================================
 
-for col in df.columns:
+if uploaded_excel and uploaded_docx:
 
-    lc = col.lower()
+    if st.button("Generate Translation File"):
 
-    if lc == "id":
-        id_col = col
+        with st.spinner("Reading questionnaire..."):
 
-    elif "source" in lc:
-        source_col = col
+            content = read_docx_content(uploaded_docx)
 
-    elif "target" in lc:
-        target_col = col
+            translation_dict = build_translation_dictionary(
+                content
+            )
 
-if not source_col:
-    raise Exception("Source column not found")
-
-if not target_col:
-    raise Exception("Target column not found")
-
-##########################################################
-# TRANSLATION
-##########################################################
-
-translated_count = 0
-
-unmatched_rows = []
-
-translations = []
-
-for idx, row in df.iterrows():
-
-    source_text = normalize_text(
-        row[source_col]
-    )
-
-    existing_target = normalize_text(
-        row[target_col]
-    )
-
-    if existing_target:
-
-        translations.append(existing_target)
-        continue
-
-    source_key = clean_for_match(source_text)
-
-    translated = ""
-
-    ######################################################
-    # EXACT MATCH
-    ######################################################
-
-    if source_key in translation_dict:
-
-        translated = translation_dict[source_key]
-
-    ######################################################
-    # FUZZY MATCH
-    ######################################################
-
-    if translated == "":
-
-        translated = fuzzy_lookup(
-            source_key,
-            translation_dict
+        st.success(
+            f"{len(translation_dict)} translation pairs extracted"
         )
 
-    ######################################################
-    # SAVE RESULT
-    ######################################################
+        # ==========================================
+        # READ EXCEL
+        # ==========================================
 
-    if translated:
+        df = pd.read_excel(uploaded_excel)
 
-        translated_count += 1
+        source_col = None
+        target_col = None
+        id_col = None
 
-    else:
+        for col in df.columns:
 
-        unmatched_rows.append({
+            lc = col.lower()
 
-            "Row": idx + 2,
+            if lc == "id":
+                id_col = col
 
-            "ID": row[id_col]
-            if id_col else "",
+            if "source" in lc:
+                source_col = col
 
-            "Source": source_text
+            if "target" in lc:
+                target_col = col
+
+        if source_col is None:
+
+            st.error("Source column not found")
+
+            st.stop()
+
+        if target_col is None:
+
+            st.error("Target column not found")
+
+            st.stop()
+
+        # ==========================================
+        # TRANSLATE
+        # ==========================================
+
+        translated = []
+        match_types = []
+        unmatched = []
+
+        translated_count = 0
+
+        for idx, row in df.iterrows():
+
+            source_text = normalize_text(
+                row[source_col]
+            )
+
+            existing_target = normalize_text(
+                row[target_col]
+            )
+
+            if existing_target:
+
+                translated.append(existing_target)
+
+                match_types.append(
+                    "Already Exists"
+                )
+
+                translated_count += 1
+
+                continue
+
+            source_key = clean_for_match(
+                source_text
+            )
+
+            result = ""
+            match_type = ""
+
+            # ----------------------
+            # Exact Match
+            # ----------------------
+
+            if source_key in translation_dict:
+
+                result = translation_dict[source_key]
+
+                match_type = "Exact"
+
+            # ----------------------
+            # Fuzzy Match
+            # ----------------------
+
+            if result == "":
+
+                fuzzy_result = fuzzy_lookup(
+                    source_key,
+                    translation_dict
+                )
+
+                if fuzzy_result:
+
+                    result = fuzzy_result
+
+                    match_type = "Fuzzy"
+
+            # ----------------------
+            # Unmatched
+            # ----------------------
+
+            if result:
+
+                translated_count += 1
+
+            else:
+
+                unmatched.append({
+
+                    "Row": idx + 2,
+
+                    "ID":
+                    row[id_col]
+                    if id_col else "",
+
+                    "Source":
+                    source_text
+
+                })
+
+                match_type = "Unmatched"
+
+            translated.append(result)
+
+            match_types.append(match_type)
+
+        # ==========================================
+        # OUTPUT
+        # ==========================================
+
+        df[target_col] = translated
+
+        df["Match Type"] = match_types
+
+        unmatched_df = pd.DataFrame(
+            unmatched
+        )
+
+        coverage = round(
+            translated_count
+            / len(df)
+            * 100,
+            2
+        )
+
+        summary_df = pd.DataFrame({
+
+            "Metric": [
+
+                "Total Rows",
+
+                "Translated Rows",
+
+                "Manual Review",
+
+                "Coverage %"
+
+            ],
+
+            "Value": [
+
+                len(df),
+
+                translated_count,
+
+                len(unmatched),
+
+                coverage
+
+            ]
         })
 
-    translations.append(translated)
+        # ==========================================
+        # DOWNLOAD FILE
+        # ==========================================
 
-##########################################################
-# WRITE OUTPUT
-##########################################################
+        output = io.BytesIO()
 
-df[target_col] = translations
+        with pd.ExcelWriter(
+            output,
+            engine="xlsxwriter"
+        ) as writer:
 
-df.to_excel(
-    OUTPUT_FILE,
-    index=False
-)
+            df.to_excel(
+                writer,
+                sheet_name="Translations",
+                index=False
+            )
 
-##########################################################
-# UNMATCHED REPORT
-##########################################################
+            unmatched_df.to_excel(
+                writer,
+                sheet_name="Unmatched",
+                index=False
+            )
 
-unmatched_df = pd.DataFrame(
-    unmatched_rows
-)
+            summary_df.to_excel(
+                writer,
+                sheet_name="Summary",
+                index=False
+            )
 
-unmatched_df.to_excel(
-    UNMATCHED_FILE,
-    index=False
-)
+        output.seek(0)
 
-##########################################################
-# SUMMARY REPORT
-##########################################################
+        st.subheader("Coverage Report")
 
-coverage = round(
-    translated_count /
-    len(df) * 100,
-    2
-)
+        c1, c2, c3, c4 = st.columns(4)
 
-report_df = pd.DataFrame({
+        c1.metric(
+            "Total Rows",
+            len(df)
+        )
 
-    "Metric":[
-        "Total Rows",
-        "Translated Rows",
-        "Manual Review",
-        "Coverage %"
-    ],
+        c2.metric(
+            "Translated",
+            translated_count
+        )
 
-    "Value":[
-        len(df),
-        translated_count,
-        len(unmatched_rows),
-        coverage
-    ]
-})
+        c3.metric(
+            "Manual Review",
+            len(unmatched)
+        )
 
-report_df.to_excel(
-    REPORT_FILE,
-    index=False
-)
+        c4.metric(
+            "Coverage %",
+            coverage
+        )
 
-##########################################################
-# DONE
-##########################################################
-
-print("="*50)
-print("Translation Complete")
-print("="*50)
-
-print(f"Total Rows     : {len(df)}")
-print(f"Translated     : {translated_count}")
-print(f"Manual Review  : {len(unmatched_rows)}")
-print(f"Coverage       : {coverage}%")
-
-print()
-print("Files Generated:")
-print(OUTPUT_FILE)
-print(UNMATCHED_FILE)
-print(REPORT_FILE)
+        st.download_button(
+            label="Download Output Workbook",
+            data=output,
+            file_name="Translated_Output.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
