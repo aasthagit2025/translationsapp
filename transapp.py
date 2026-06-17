@@ -99,12 +99,12 @@ def build_blocks(content):
     current_block = None
 
     pattern = re.compile(
-        r"^([A-Z]+\d+)\."
+        r"([A-Z]+\d+)\."
     )
 
     for line in content:
 
-        m = pattern.match(line)
+        m = pattern.search(line)
 
         if m:
 
@@ -192,7 +192,9 @@ if uploaded_excel and uploaded_docx:
 
             content = read_docx(
                 uploaded_docx
+
             )
+         
 
             blocks = build_blocks(
                 content
