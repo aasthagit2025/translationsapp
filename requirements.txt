@@ -3,3 +3,5 @@ pandas
 openpyxl
 python-docx
 rapidfuzz
+xlsxwriter
+lxml
