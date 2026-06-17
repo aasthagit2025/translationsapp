@@ -5,127 +5,142 @@ from rapidfuzz import fuzz
 import io
 import re
 
-st.set_page_config(page_title="Final Sawtooth Layout Automator", layout="centered")
+st.set_page_config(page_title="Color-Strict Sawtooth Layout Automator", layout="centered")
 
-st.title("🎯 Final Sawtooth Translation Automator")
-st.write("Strictly correlates Question ID -> Source Text Token -> Clean Translation Mapping.")
+st.title("🎯 Color-Strict Sawtooth Translation Automator")
+st.write("Extracts ONLY the text matching your designated Font Color within the targeted Question ID section.")
 
-# --- Core Matrix Alignment Logic ---
-def parse_word_by_question_blocks(docx_file):
+# --- Core Color-Strict Matrix Logic ---
+def is_run_color_match(run, target_color):
+    """Verifies if an individual word segment matches the target color description."""
+    font_color = run.font.color
+    if not font_color or font_color.rgb is None:
+        return False
+        
+    hex_str = str(font_color.rgb).lower()
+    tc = target_color.lower().strip()
+    
+    if tc == 'green':
+        # Target standard Office Green variations found in Qre docs (e.g., '00b050', '008000')
+        if hex_str.startswith('00b050') or hex_str.startswith('0080') or hex_str.startswith('4c9') or hex_str.startswith('00a'):
+            return True
+        # Algorithmic check: Is Green significantly stronger than Red and Blue channels?
+        if len(hex_str) == 6:
+            try:
+                r = int(hex_str[0:2], 16)
+                g = int(hex_str[2:4], 16)
+                b = int(hex_str[4:6], 16)
+                if g > r * 1.2 and g > b * 1.2 and g > 40:
+                    return True
+            except ValueError:
+                pass
+    elif tc == 'red' and (hex_str.startswith('ff0000') or hex_str.startswith('c00000')):
+        return True
+    elif tc == 'blue' and (hex_str.startswith('0000ff') or hex_str.startswith('1f4e79')):
+        return True
+    elif tc.replace('#', '') in hex_str:
+        return True
+        
+    return False
+
+def parse_word_sections_by_color(docx_file, target_color):
     """
-    Chronologically splits the questionnaire docx file into strict dictionary sections.
-    Key: Question Code (e.g., INTRO, S1, S2, Q1)
-    Value: List of strings (options, text blocks) belonging exclusively to that question.
+    Chronologically reads the questionnaire and maps text tokens.
+    Separates items into lists of structured segments matching the target color inside each Question block.
     """
     doc = Document(docx_file)
     sections = {"GLOBAL": []}
     current_section = "GLOBAL"
     
-    all_lines = []
-    # Extract paragraphs
-    for para in doc.paragraphs:
-        txt = para.text.strip()
-        if txt:
-            all_lines.append(txt)
-    # Extract tables
-    for table in doc.tables:
-        for row in table.rows:
-            cells_txt = [c.text.strip() for c in row.cells if c.text.strip()]
-            if cells_txt:
-                all_lines.append(" | ".join(cells_txt))
-                
-    # Strict regex to identify true question headers (e.g., Intro., S1., S2., Q5., [S1])
-    # Looks for S, Q, D or Intro followed by digits/letters at the beginning of a line
+    # Structural rule to spot new questions (e.g., Intro., S1., Q5.)
     q_pattern = re.compile(r'^(?:\[)?(INTRO|[SQD]\d+[a-zA-Z0-9]*)(?:\])?[\.\s\:]', re.IGNORECASE)
     
-    for line in all_lines:
-        match = q_pattern.match(line)
+    # 1. Process Paragraph rows
+    for para in doc.paragraphs:
+        plain_text = para.text.strip()
+        match = q_pattern.match(plain_text)
         if match:
             current_section = match.group(1).upper()
             if current_section not in sections:
                 sections[current_section] = []
         
-        sections[current_section].append(line)
-        sections["GLOBAL"].append(line)
+        # Analyze individual delimited segments in a line
+        raw_parts = [p.strip() for p in plain_text.split(',') if p.strip()] if ',' in plain_text else [plain_text]
         
+        # Cross reference paragraph chunks with font formatting runs
+        for run in para.runs:
+            run_text = run.text.strip()
+            if run_text and is_run_color_match(run, target_color):
+                # If it's isolated colored target text, append to section tracking
+                sections[current_section].append((plain_text, run_text))
+                sections["GLOBAL"].append((plain_text, run_text))
+                
+    # 2. Process Table cells
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    p_text = p.text.strip()
+                    match = q_pattern.match(p_text)
+                    if match:
+                        current_section = match.group(1).upper()
+                        if current_section not in sections:
+                            sections[current_section] = []
+                            
+                    for run in p.runs:
+                        run_text = run.text.strip()
+                        if run_text and is_run_color_match(run, target_color):
+                            sections[current_section].append((p_text, run_text))
+                            sections["GLOBAL"].append((p_text, run_text))
+                            
     return sections
 
-def extract_strict_translation(source_text, section_lines):
-    """
-    Looks inside the isolated question block lines for a structured line (comma or pipe separated)
-    where one part exactly matches the English source_text, then returns the corresponding translation.
-    """
-    src_clean = source_text.strip().lower()
-    
-    for line in section_lines:
-        # Split line by common survey layout delimiters
-        parts = []
-        if '|' in line:
-            parts = [p.strip() for p in line.split('|')]
-        elif ',' in line:
-            parts = [p.strip() for p in line.split(',')]
-        else:
-            # Check sequential lines layout if not split on a single line
-            continue
-            
-        if len(parts) >= 2:
-            # Step 2: Identify where the English source text matches
-            for idx, part in enumerate(parts):
-                part_clean = part.strip().lower()
-                
-                # Check for exact or highly precise token match
-                if part_clean == src_clean or fuzz.ratio(part_clean, src_clean) > 96:
-                    # Find the translated string next to it or across the tokens
-                    # Usually: [English, Translation, Code] or [English, Translation]
-                    for target_idx, candidate in enumerate(parts):
-                        if target_idx != idx and not candidate.isdigit():
-                            cand_clean = candidate.strip()
-                            # Ensure it isn't identical to the source English text
-                            if cand_clean.lower() != src_clean:
-                                return cand_clean
-                                
-    # Fallback to consecutive line pairing check within the section
-    for i in range(len(section_lines) - 1):
-        if section_lines[i].strip().lower() == src_clean:
-            next_line = section_lines[i+1].strip()
-            # Verify the next line isn't a routing command or structural label
-            if next_line and not next_line.startswith('[') and not next_line.isdigit():
-                return next_line
-                
-    return None
-
-def identify_question_code(sawtooth_id):
-    """
-    Extracts the explicit question identifier label from the Sawtooth ID string.
-    e.g., "List 'IntroList' - Item 1 - Display Text" -> "INTRO"
-    e.g., "Question 'S1' - Body Text" -> "S1"
-    """
+def get_clean_question_id(sawtooth_id):
+    """Isolates the target Question token from Sawtooth structure naming formats."""
     sawtooth_id = str(sawtooth_id)
-    # Target strings inside single quotes first
     match = re.search(r"'([a-zA-Z0-9]+)", sawtooth_id)
     if match:
         code = match.group(1)
-        # Strip trailing functional suffixes like 'List' or 'Term'
+        # Strip trailing functional suffixes like 'List' to get back to core question tag
         code = re.sub(r'(List|Term|Qnr|Labels)$', '', code, flags=re.IGNORECASE)
         return code.upper()
-    
-    # Fallback if no single quotes exist (standard row names)
-    match_fallback = re.search(r"^(INTRO|[SQD]\d+)", sawtooth_id, re.IGNORECASE)
-    if match_fallback:
-        return match_fallback.group(1).upper()
-        
     return "GLOBAL"
 
-# --- Streamlit UI Configuration ---
-st.sidebar.header("⚙️ Configuration Matrix")
+def find_colored_translation(source_text, section_tuples):
+    """
+    Finds the exact line match inside the section pool and extracts 
+    ONLY the part that matches the designated color run.
+    """
+    src_clean = source_text.strip().lower()
+    
+    # Step 1: Strict Line Match via row data splits
+    for plain_line, color_text in section_tuples:
+        # Check if the overall row text contains our English token
+        parts = [p.strip().lower() for p in plain_line.split(',') if p.strip()] if ',' in plain_line else [plain_line.lower()]
+        
+        if src_clean in parts or any(fuzz.ratio(p, src_clean) > 96 for p in parts):
+            # Avoid re-adding English source if it was formatted in the color run
+            if color_text.lower() != src_clean and not color_text.isdigit():
+                return color_text
+                
+    return None
+
+# --- UI Layout Controls ---
+st.sidebar.header("⚙️ Target Parameter Matrix")
 target_column_input = st.sidebar.text_input("Target Language Column Name", value="Target: philippines")
+color_selection = st.sidebar.selectbox("Translation Font Color in Word", ["Green", "Red", "Blue", "Custom Hex"])
+
+if color_selection == "Custom Hex":
+    chosen_color = st.sidebar.text_input("Enter Font Hex (e.g., 00B050)", value="00B050")
+else:
+    chosen_color = color_selection
 
 uploaded_excel = st.file_uploader("1. Upload Sawtooth Export (Excel or CSV)", type=["xlsx", "csv"])
 uploaded_docx = st.file_uploader("2. Upload Questionnaire Word File (.docx)", type=["docx"])
 
 if uploaded_excel and uploaded_docx:
-    if st.button("🚀 Match and Map Translations", use_container_width=True):
-        with st.spinner("Processing strict block verification logic..."):
+    if st.button("🚀 Run Color-Strict Extraction", use_container_width=True):
+        with st.spinner(f"Scraping pure '{chosen_color}' tokens for target '{target_column_input}'..."):
             try:
                 if uploaded_excel.name.endswith('.csv'):
                     df = pd.read_csv(uploaded_excel)
@@ -133,61 +148,57 @@ if uploaded_excel and uploaded_docx:
                     df = pd.read_excel(uploaded_excel)
                 
                 if 'Source: en' not in df.columns or 'Id' not in df.columns:
-                    st.error("Error: Missing required columns 'Id' or 'Source: en'.")
+                    st.error("Error: Missing critical layout coordinates 'Id' or 'Source: en'.")
                     st.stop()
-                
-                # Setup target column structure dynamically
+                    
                 df[target_column_input] = ""
                 df[target_column_input] = df[target_column_input].astype(object)
                 df['Source: en'] = df['Source: en'].astype(str)
 
-                # Step 1: Divide the Word file into isolated question blocks
-                word_sections = parse_word_by_question_blocks(uploaded_docx)
+                # Map Word doc structure isolating targeted color run elements
+                word_color_sections = parse_word_sections_by_color(uploaded_docx, chosen_color)
                 translations_added = 0
                 
-                # Step 2 & 3: Iterate rows and match based on strict parameters
                 for idx, row in df.iterrows():
                     source_text = str(row['Source: en']).strip()
                     sawtooth_id = row['Id']
                     
                     if not source_text or source_text.lower() in ['nan', ''] or source_text.isdigit():
                         continue
+                        
+                    # 1. Check ID Column to find Question No
+                    q_code = get_clean_question_id(sawtooth_id)
+                    section_tuples = word_color_sections.get(q_code, word_color_sections["GLOBAL"])
                     
-                    # Identify the Question Code from the Id column
-                    q_code = identify_question_code(sawtooth_id)
+                    # 2. Check Source Column text matching inside isolated color segments
+                    translation = find_colored_translation(source_text, section_tuples)
                     
-                    # Fetch lines belonging exclusively to that Question section
-                    section_lines = word_sections.get(q_code, word_sections["GLOBAL"])
-                    
-                    # Look up exact token translation inside that specific block
-                    translation = extract_strict_translation(source_text, section_lines)
-                    
-                    # General backup pass across the entire doc if structural naming didn't match perfectly
+                    # Backup global sweep if naming conventions missed the section dictionary box
                     if not translation and q_code != "GLOBAL":
-                        translation = extract_strict_translation(source_text, word_sections["GLOBAL"])
+                        translation = find_colored_translation(source_text, word_color_sections["GLOBAL"])
                         
                     if translation:
                         df.at[idx, target_column_input] = translation
                         translations_added += 1
 
-                st.success(f"Successfully processed! Populated {translations_added} accurate translation pairs.")
+                st.success(f"Success! Populated {translations_added} clean, color-filtered target matches.")
                 
-                # Build download buffer
+                # Output Generator
                 output = io.BytesIO()
                 if uploaded_excel.name.endswith('.csv'):
                     df.to_csv(output, index=False)
                     mime_type = "text/csv"
-                    out_filename = "Sawtooth_Strict_Final.csv"
+                    out_filename = "Sawtooth_ColorStrict_Output.csv"
                 else:
                     with pd.ExcelWriter(output, engine='openpyxl') as writer:
                         df.to_excel(writer, index=False)
                     mime_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    out_filename = "Sawtooth_Strict_Final.xlsx"
+                    out_filename = "Sawtooth_ColorStrict_Output.xlsx"
                 
                 output.seek(0)
                 
                 st.download_button(
-                    label=f"📥 Download Updated {target_column_input} File",
+                    label=f"📥 Download Finalized {target_column_input} Sheet",
                     data=output,
                     file_name=out_filename,
                     mime=mime_type,
@@ -195,4 +206,4 @@ if uploaded_excel and uploaded_docx:
                 )
                 
             except Exception as e:
-                st.error(f"An error occurred during final processing: {str(e)}")
+                st.error(f"Processing error: {str(e)}")
