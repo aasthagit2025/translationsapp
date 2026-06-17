@@ -62,7 +62,7 @@ if uploaded_excel and uploaded_docx:
     if st.button("🚀 Process & Generate Translations", use_container_width=True):
         with st.spinner("Analyzing text alignment & running fuzzy matching..."):
             try:
-                # Load Excel/CSV
+                # Load Excel/CSV and forcefully cast columns to avoid dtype/float64 assignment crashes
                 if uploaded_excel.name.endswith('.csv'):
                     df = pd.read_csv(uploaded_excel)
                 else:
@@ -73,6 +73,10 @@ if uploaded_excel and uploaded_docx:
                     st.error("Error: The uploaded sheet must contain 'Source: en' and 'Target: en' columns.")
                     st.stop()
 
+                # FIX: Force the translation target column to accept text strings 
+                df['Target: en'] = df['Target: en'].astype(object)
+                df['Source: en'] = df['Source: en'].astype(str)
+
                 # Process Word Document
                 word_blocks = extract_text_from_word(uploaded_docx)
                 translation_lookup = build_translation_mappings(word_blocks)
@@ -81,9 +85,9 @@ if uploaded_excel and uploaded_docx:
                 # Process Matching
                 translations_added = 0
                 for idx, row in df.iterrows():
-                    source_text = str(row['Source: en']).strip() if pd.notnull(row['Source: en']) else ""
+                    source_text = str(row['Source: en']).strip()
                     
-                    if not source_text or source_text.isdigit():
+                    if not source_text or source_text.lower() == 'nan' or source_text.isdigit():
                         continue
                         
                     # 1. Direct exact match check
