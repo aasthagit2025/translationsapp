@@ -1,434 +1,127 @@
 import streamlit as st
 import pandas as pd
-import re
+from docx import Document
+from rapidfuzz import process, fuzz
 import io
 
-from docx import Document
-from rapidfuzz import fuzz
+st.set_page_config(page_title="Sawtooth Translation Automator", layout="centered")
 
-# =====================================================
-# CONFIG
-# =====================================================
+st.title("🔄 Sawtooth Translation Automator")
+st.write("Upload your English Sawtooth Excel export and your translated Word Questionnaire to auto-populate the translation columns.")
 
-FUZZY_THRESHOLD = 92
-
-# =====================================================
-# HELPERS
-# =====================================================
-
-def normalize_text(text):
-
-    if pd.isna(text):
-        return ""
-
-    text = str(text)
-
-    text = text.replace("\n", " ")
-    text = text.replace("\r", " ")
-
-    text = re.sub(r"\s+", " ", text)
-
-    return text.strip()
-
-
-def clean_for_match(text):
-
-    text = normalize_text(text)
-
-    text = text.lower()
-
-    text = re.sub(r"[^\w\s]", "", text)
-
-    return text.strip()
-
-
-def contains_latin(text):
-
-    return bool(re.search(r"[A-Za-z]", str(text)))
-
-
-# =====================================================
-# DOCX READER
-# =====================================================
-
-def read_docx_content(uploaded_docx):
-
-    doc = Document(uploaded_docx)
-
-    content = []
-
-    # Paragraphs
-    for p in doc.paragraphs:
-
-        txt = normalize_text(p.text)
-
-        if txt:
-            content.append(txt)
-
-    # Tables
+# --- Helper Functions ---
+def extract_text_from_word(docx_file):
+    """Extracts all text blocks from paragraphs and tables in the uploaded Word file."""
+    doc = Document(docx_file)
+    raw_blocks = []
+    
+    # Extract from paragraphs
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if text:
+            raw_blocks.append(text)
+            
+    # Extract from tables
     for table in doc.tables:
-
         for row in table.rows:
+            row_text = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+            if row_text:
+                raw_blocks.append(" | ".join(row_text))
+                
+    return raw_blocks
 
-            for cell in row.cells:
+def build_translation_mappings(raw_blocks):
+    """Parses text lines to capture comma-separated list options or consecutive translated rows."""
+    mapping_dict = {}
+    
+    for i in range(len(raw_blocks)):
+        current_line = raw_blocks[i]
+        
+        # Scenario A: Comma separated inline list items (e.g., 'The Philippines,Pilipinas,4')
+        if ',' in current_line:
+            parts = [p.strip() for p in current_line.split(',')]
+            if len(parts) >= 2:
+                eng_opt = parts[0]
+                trans_opt = parts[1]
+                if eng_opt and not eng_opt.isdigit() and trans_opt:
+                    mapping_dict[eng_opt] = trans_opt
+        
+        # Scenario B: Pairs of sequential paragraphs (English line followed by Translated line)
+        if i < len(raw_blocks) - 1:
+            next_line = raw_blocks[i+1]
+            if current_line != next_line and not current_line.startswith('[') and not next_line.startswith('['):
+                mapping_dict[current_line] = next_line
+                
+    return mapping_dict
 
-                txt = normalize_text(cell.text)
-
-                if txt:
-                    content.append(txt)
-
-    return content
-
-
-# =====================================================
-# TRANSLATION DICTIONARY
-# =====================================================
-
-def build_translation_dictionary(content):
-
-    translations = {}
-
-    for i in range(len(content) - 1):
-
-        current = normalize_text(content[i])
-        nxt = normalize_text(content[i + 1])
-
-        if not current:
-            continue
-
-        if not nxt:
-            continue
-
-        if current == nxt:
-            continue
-
-        if len(current) < 2:
-            continue
-
-        if len(nxt) < 2:
-            continue
-
-        if current.isnumeric():
-            continue
-
-        if nxt.isnumeric():
-            continue
-
-        if contains_latin(current):
-
-            key = clean_for_match(current)
-
-            if key not in translations:
-
-                translations[key] = nxt
-
-    return translations
-
-
-# =====================================================
-# FUZZY MATCH
-# =====================================================
-
-def fuzzy_lookup(source_key, translation_dict):
-
-    best_score = 0
-    best_translation = ""
-
-    for k, v in translation_dict.items():
-
-        score = fuzz.ratio(source_key, k)
-
-        if score > best_score:
-
-            best_score = score
-            best_translation = v
-
-    if best_score >= FUZZY_THRESHOLD:
-
-        return best_translation
-
-    return ""
-
-
-# =====================================================
-# STREAMLIT UI
-# =====================================================
-
-st.set_page_config(
-    page_title="Survey Translation Tool",
-    layout="wide"
-)
-
-st.title("Survey Translation Automation Tool")
-
-st.markdown(
-    "Upload Sawtooth Export and translated Word questionnaire."
-)
-
-uploaded_excel = st.file_uploader(
-    "Upload Sawtooth Export (.xlsx)",
-    type=["xlsx"]
-)
-
-uploaded_docx = st.file_uploader(
-    "Upload Translated Questionnaire (.docx)",
-    type=["docx"]
-)
-
-# =====================================================
-# PROCESS
-# =====================================================
+# --- UI File Uploads ---
+uploaded_excel = st.file_uploader("1. Upload Sawtooth Export (Excel or CSV)", type=["xlsx", "csv"])
+uploaded_docx = st.file_uploader("2. Upload Translated Word Doc (.docx)", type=["docx"])
 
 if uploaded_excel and uploaded_docx:
+    if st.button("🚀 Process & Generate Translations", use_container_width=True):
+        with st.spinner("Analyzing text alignment & running fuzzy matching..."):
+            try:
+                # Load Excel/CSV
+                if uploaded_excel.name.endswith('.csv'):
+                    df = pd.read_csv(uploaded_excel)
+                else:
+                    df = pd.read_excel(uploaded_excel)
+                
+                # Check column requirements
+                if 'Source: en' not in df.columns or 'Target: en' not in df.columns:
+                    st.error("Error: The uploaded sheet must contain 'Source: en' and 'Target: en' columns.")
+                    st.stop()
 
-    if st.button("Generate Translation File"):
+                # Process Word Document
+                word_blocks = extract_text_from_word(uploaded_docx)
+                translation_lookup = build_translation_mappings(word_blocks)
+                english_keys = list(translation_lookup.keys())
 
-        with st.spinner("Reading questionnaire..."):
+                # Process Matching
+                translations_added = 0
+                for idx, row in df.iterrows():
+                    source_text = str(row['Source: en']).strip() if pd.notnull(row['Source: en']) else ""
+                    
+                    if not source_text or source_text.isdigit():
+                        continue
+                        
+                    # 1. Direct exact match check
+                    if source_text in translation_lookup:
+                        df.at[idx, 'Target: en'] = translation_lookup[source_text]
+                        translations_added += 1
+                    else:
+                        # 2. Fuzzy fallback match (85% threshold)
+                        match = process.extractOne(source_text, english_keys, scorer=fuzz.token_sort_ratio)
+                        if match and match[1] >= 85:
+                            matched_eng_key = match[0]
+                            df.at[idx, 'Target: en'] = translation_lookup[matched_eng_key]
+                            translations_added += 1
 
-            content = read_docx_content(uploaded_docx)
-
-            translation_dict = build_translation_dictionary(
-                content
-            )
-
-        st.success(
-            f"{len(translation_dict)} translation pairs extracted"
-        )
-
-        # ==========================================
-        # READ EXCEL
-        # ==========================================
-
-        df = pd.read_excel(uploaded_excel)
-
-        source_col = None
-        target_col = None
-        id_col = None
-
-        for col in df.columns:
-
-            lc = col.lower()
-
-            if lc == "id":
-                id_col = col
-
-            if "source" in lc:
-                source_col = col
-
-            if "target" in lc:
-                target_col = col
-
-        if source_col is None:
-
-            st.error("Source column not found")
-
-            st.stop()
-
-        if target_col is None:
-
-            st.error("Target column not found")
-
-            st.stop()
-
-        # ==========================================
-        # TRANSLATE
-        # ==========================================
-
-        translated = []
-        match_types = []
-        unmatched = []
-
-        translated_count = 0
-
-        for idx, row in df.iterrows():
-
-            source_text = normalize_text(
-                row[source_col]
-            )
-
-            existing_target = normalize_text(
-                row[target_col]
-            )
-
-            if existing_target:
-
-                translated.append(existing_target)
-
-                match_types.append(
-                    "Already Exists"
+                st.success(f"Done! Automatically populated {translations_added} translation strings.")
+                
+                # Prepare binary output buffer for user download
+                output = io.BytesIO()
+                if uploaded_excel.name.endswith('.csv'):
+                    df.to_csv(output, index=False)
+                    mime_type = "text/csv"
+                    out_filename = "Sawtooth_Translations_Ready.csv"
+                else:
+                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                        df.to_excel(writer, index=False)
+                    mime_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    out_filename = "Sawtooth_Translations_Ready.xlsx"
+                
+                output.seek(0)
+                
+                # Download Button
+                st.download_button(
+                    label="📥 Download Updated Sawtooth Sheet",
+                    data=output,
+                    file_name=out_filename,
+                    mime=mime_type,
+                    use_container_width=True
                 )
-
-                translated_count += 1
-
-                continue
-
-            source_key = clean_for_match(
-                source_text
-            )
-
-            result = ""
-            match_type = ""
-
-            # ----------------------
-            # Exact Match
-            # ----------------------
-
-            if source_key in translation_dict:
-
-                result = translation_dict[source_key]
-
-                match_type = "Exact"
-
-            # ----------------------
-            # Fuzzy Match
-            # ----------------------
-
-            if result == "":
-
-                fuzzy_result = fuzzy_lookup(
-                    source_key,
-                    translation_dict
-                )
-
-                if fuzzy_result:
-
-                    result = fuzzy_result
-
-                    match_type = "Fuzzy"
-
-            # ----------------------
-            # Unmatched
-            # ----------------------
-
-            if result:
-
-                translated_count += 1
-
-            else:
-
-                unmatched.append({
-
-                    "Row": idx + 2,
-
-                    "ID":
-                    row[id_col]
-                    if id_col else "",
-
-                    "Source":
-                    source_text
-
-                })
-
-                match_type = "Unmatched"
-
-            translated.append(result)
-
-            match_types.append(match_type)
-
-        # ==========================================
-        # OUTPUT
-        # ==========================================
-
-        df[target_col] = translated
-
-        df["Match Type"] = match_types
-
-        unmatched_df = pd.DataFrame(
-            unmatched
-        )
-
-        coverage = round(
-            translated_count
-            / len(df)
-            * 100,
-            2
-        )
-
-        summary_df = pd.DataFrame({
-
-            "Metric": [
-
-                "Total Rows",
-
-                "Translated Rows",
-
-                "Manual Review",
-
-                "Coverage %"
-
-            ],
-
-            "Value": [
-
-                len(df),
-
-                translated_count,
-
-                len(unmatched),
-
-                coverage
-
-            ]
-        })
-
-        # ==========================================
-        # DOWNLOAD FILE
-        # ==========================================
-
-        output = io.BytesIO()
-
-        with pd.ExcelWriter(
-            output,
-            engine="xlsxwriter"
-        ) as writer:
-
-            df.to_excel(
-                writer,
-                sheet_name="Translations",
-                index=False
-            )
-
-            unmatched_df.to_excel(
-                writer,
-                sheet_name="Unmatched",
-                index=False
-            )
-
-            summary_df.to_excel(
-                writer,
-                sheet_name="Summary",
-                index=False
-            )
-
-        output.seek(0)
-
-        st.subheader("Coverage Report")
-
-        c1, c2, c3, c4 = st.columns(4)
-
-        c1.metric(
-            "Total Rows",
-            len(df)
-        )
-
-        c2.metric(
-            "Translated",
-            translated_count
-        )
-
-        c3.metric(
-            "Manual Review",
-            len(unmatched)
-        )
-
-        c4.metric(
-            "Coverage %",
-            coverage
-        )
-
-        st.download_button(
-            label="Download Output Workbook",
-            data=output,
-            file_name="Translated_Output.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+                
+            except Exception as e:
+                st.error(f"An error occurred during processing: {str(e)}")
