@@ -1,6 +1,8 @@
 import html
 import io
 import re
+from difflib import SequenceMatcher
+import zipfile
 
 import pandas as pd
 import streamlit as st
@@ -46,6 +48,7 @@ def strip_sawtooth_markup(text):
     text = re.sub(r"\[%.*?%\]", " ", text, flags=re.I | re.S)
     text = re.sub(r"\bVALUE\s*\([^)]*\)", " ", text, flags=re.I)
     text = re.sub(r"\bLISTLABEL\s*\([^)]*\)", " ", text, flags=re.I)
+    text = re.sub(r"\bLABEL\s*\([^)]*\)", " ", text, flags=re.I)
     text = re.sub(r"\bBegin\s+Unverified\s+Perl\b", " ", text, flags=re.I)
     text = re.sub(r"\bEnd\s+Unverified\b", " ", text, flags=re.I)
     return text
@@ -63,6 +66,14 @@ def strip_leading_conditions(text):
 def normalize(text):
     text = strip_leading_conditions(text).lower()
     text = re.sub(r"\[[^\]]+\]", " ", text)
+    text = text.replace("(nearsightedness)", " ")
+    text = text.replace("using/ receiving", "using")
+    text = text.replace("current custom-mixed atropine", "current atropine")
+    text = re.sub(
+        r"\bis\s+(?:sgd|twd|thb|krw|myr|php)(?:\s*/\s*(?:sgd|twd|thb|krw|myr|php))*\s*",
+        "is ",
+        text,
+    )
     replacements = {
         "’": "'",
         "‘": "'",
@@ -74,8 +85,17 @@ def normalize(text):
     for source, target in replacements.items():
         text = text.replace(source, target)
     text = text.replace("_", " ")
+    text = re.sub(r"\byour child s\b", "your", text)
     text = re.sub(r"[^\w\s%./()\-]+", " ", text)
+    text = re.sub(r"^\s*[a-z]\.\s+", " ", text)
+    text = re.sub(r"\s+-\s+", " ", text)
     text = re.sub(r"\s+", " ", text)
+    endpoint = re.match(
+        r"^((?:very|extremely|not|no)\b.+?)\s+(\d{1,2})$",
+        text,
+    )
+    if endpoint:
+        text = f"{endpoint.group(2)} {endpoint.group(1)}"
     return text.strip()
 
 
@@ -111,6 +131,9 @@ def preserve_html_markup(source_text, translated_text):
     if not text_indexes:
         return translated_text
 
+    if len(text_indexes) > 1 and not re.search(r"\[%.*?%\]", source_text, flags=re.I | re.S):
+        return translated_text
+
     first_text_index = text_indexes[0]
     first_text = parts[first_text_index]
     leading_space = re.match(r"^\s*", first_text).group(0)
@@ -125,6 +148,117 @@ def preserve_html_markup(source_text, translated_text):
         parts[index] = f"{leading_space}{trailing_space}"
 
     return "".join(parts)
+
+
+def translate_plain_text(source_text, memory, use_fuzzy, threshold):
+    key = normalize(source_text)
+    if not key:
+        if has_protected_markup(source_text):
+            return str(source_text), "copied_markup", 100
+        return "", "empty", 0
+
+    if key in memory:
+        return memory[key]["target"], "exact", 100
+
+    visible_source = clean_text(strip_sawtooth_markup(source_text), strip_html=True)
+    if re.fullmatch(r"[\d.]+|[A-Z]{3}", visible_source.strip()):
+        return visible_source.strip(), "copied", 100
+
+    if re.search(r"<script\b", str(source_text), flags=re.I):
+        return str(source_text), "copied_markup", 100
+
+    if use_fuzzy and process and memory:
+        match = process.extractOne(key, memory.keys(), scorer=fuzz.ratio)
+        if match and match[1] >= threshold:
+            matched_key, score, _ = match
+            return memory[matched_key]["target"], "fuzzy", int(score)
+        if (
+            match
+            and len(key) > 80
+            and match[1] >= 60
+            and key[:35] == match[0][:35]
+        ):
+            return memory[match[0]]["target"], "fuzzy_long", int(match[1])
+
+    return "", "unmatched", 0
+
+
+def translate_from_contained_phrases(source_text, memory):
+    key = normalize(source_text)
+    if len(key) < 40:
+        return "", "unmatched", 0
+
+    candidates = []
+    for memory_key, item in memory.items():
+        if len(memory_key) < 40:
+            continue
+        position = key.find(memory_key)
+        if position >= 0:
+            candidates.append((position, position + len(memory_key), len(memory_key), item["target"]))
+
+    if not candidates:
+        return "", "unmatched", 0
+
+    candidates.sort(key=lambda item: (item[0], -item[2]))
+    selected = []
+    occupied_until = -1
+    for start, end, _, target in candidates:
+        if start >= occupied_until:
+            selected.append(target)
+            occupied_until = end
+
+    if selected:
+        return " ".join(selected), "composite", 100
+
+    return "", "unmatched", 0
+
+
+def is_meaningful_untranslated_text(text):
+    text = clean_text(strip_sawtooth_markup(text), strip_html=True)
+    text = re.sub(r"https?://\S+", " ", text, flags=re.I)
+    letters = re.sub(r"[^A-Za-z]+", "", text)
+    return len(letters) > 4
+
+
+def translate_composite_markup(source_text, memory, use_fuzzy, threshold):
+    source_text = "" if pd.isna(source_text) else str(source_text)
+    if not has_protected_markup(source_text):
+        return "", "unmatched", 0
+
+    parts = re.split(r"(<br\s*/?>|\[%.*?%\])", source_text, flags=re.I | re.S)
+    translated_count = 0
+    untranslated_count = 0
+    scores = []
+
+    for index, part in enumerate(parts):
+        if not part or re.fullmatch(r"<br\s*/?>", part, flags=re.I) or part.startswith("[%"):
+            continue
+
+        leading_space = re.match(r"^\s*", part).group(0)
+        trailing_space = re.search(r"\s*$", part).group(0)
+        core = part[len(leading_space) : len(part) - len(trailing_space)]
+        translation, status, score = translate_plain_text(
+            core,
+            memory,
+            use_fuzzy,
+            threshold,
+        )
+        if not translation:
+            translation, status, score = translate_from_contained_phrases(core, memory)
+        if translation:
+            translated_part = preserve_html_markup(core, translation)
+            parts[index] = f"{leading_space}{translated_part}{trailing_space}"
+            translated_count += 1
+            if score:
+                scores.append(score)
+        elif is_meaningful_untranslated_text(core):
+            untranslated_count += 1
+
+    if translated_count and untranslated_count <= translated_count:
+        score = min(scores) if scores else 100
+        return "".join(parts), "composite", score
+
+    return "", "unmatched", 0
 
 
 def looks_like_non_translation(text):
@@ -179,6 +313,138 @@ def add_translation_pair(memory, source, target, origin):
     memory.setdefault(key, {"target": target, "origin": origin, "source": source})
 
 
+def contains_urdu(text):
+    return bool(re.search(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]", str(text)))
+
+
+def add_mixed_script_pairs_from_text(memory, text, origin):
+    text = clean_text(text, strip_html=True)
+    if not text or not contains_urdu(text):
+        return
+
+    urdu_block_pattern = re.compile(
+        r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]"
+        r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\s،؛؟ءآأؤإئابپتٹثجچحخدڈذرڑزژسشصضطظعغفقکگلمنںوہھہیےَُِّْٰ]*"
+    )
+
+    for match in urdu_block_pattern.finditer(text):
+        target = clean_text(match.group(0))
+        if not target:
+            continue
+
+        prefix = text[max(0, match.start() - 220) : match.start()]
+        source_tokens = re.findall(
+            r"[A-Za-z][A-Za-z0-9’'&/().,\-]*",
+            prefix,
+        )
+        if not source_tokens:
+            continue
+
+        stopwords = {
+            "code",
+            "action",
+            "continue",
+            "close",
+            "terminate",
+            "region",
+            "city",
+            "area",
+            "instruction",
+            "instructions",
+            "scripter",
+        }
+        source_tokens = [token for token in source_tokens if token.lower() not in stopwords]
+
+        for length in range(1, min(10, len(source_tokens)) + 1):
+            source = " ".join(source_tokens[-length:])
+            if len(source) < 2:
+                continue
+            add_translation_pair(memory, source, target, f"{origin} mixed script")
+
+
+def add_mixed_script_pairs_from_docx_xml(memory, doc_file):
+    try:
+        with zipfile.ZipFile(doc_file) as package:
+            xml_text = package.read("word/document.xml").decode("utf-8", "ignore")
+    except Exception:
+        return
+
+    xml_text = re.sub(r"<[^>]+>", " ", xml_text)
+    xml_text = html.unescape(xml_text)
+    xml_text = clean_text(xml_text)
+    add_mixed_script_pairs_from_text(memory, xml_text, "docx xml")
+
+
+def add_common_urdu_pairs(memory):
+    if not any(contains_urdu(item["target"]) for item in memory.values()):
+        return
+
+    common_pairs = {
+        "English": "انگریزی",
+        "Urdu": "اردو",
+        "Central Punjab": "وسطی پنجاب",
+        "North": "شمال",
+        "Sindh & Baluchistan": "سندھ اور بلوچستان",
+        "South Punjab": "جنوبی پنجاب",
+    }
+    for source, target in common_pairs.items():
+        add_translation_pair(memory, source, target, "common Urdu fallback")
+
+
+def add_derived_scale_pairs(memory):
+    additions = {}
+    endpoint_additions = {}
+    for key, item in memory.items():
+        source_match = re.match(r"^(\d{1,2})\s+(.+)$", key)
+        if source_match:
+            number, source_label = source_match.groups()
+            target_match = re.match(
+                rf"^\s*{re.escape(number)}\s*[–\-]?\s*(.+?)\s*$",
+                item["target"],
+            )
+            if target_match:
+                additions.setdefault(
+                    normalize(source_label),
+                    {
+                        "target": target_match.group(1),
+                        "origin": f"{item['origin']} scale label",
+                        "source": source_label,
+                    },
+                )
+
+        endpoints = re.search(
+            r"where\s+1\s*=?\s*(.+?)\s+and\s+7\s*=?\s*(.+?)(?:,|\.|\?|$)",
+            item["source"],
+            flags=re.I,
+        )
+        target_endpoints = re.search(
+            r"kung\s+saan.*?1\s*(?:=|ay nangangahulugang)\s*\"?(.+?)\"?\s+at\s+(?:ang\s+)?7\s*(?:=|ay nangangahulugang)\s*\"?(.+?)\"?(?:,|\.|$)",
+            item["target"],
+            flags=re.I,
+        )
+        if endpoints and target_endpoints:
+            endpoint_additions.setdefault(
+                normalize(endpoints.group(1).lstrip("= ")),
+                {
+                    "target": target_endpoints.group(1).strip(),
+                    "origin": f"{item['origin']} scale endpoint",
+                    "source": endpoints.group(1),
+                },
+            )
+            endpoint_additions.setdefault(
+                normalize(endpoints.group(2).lstrip("= ")),
+                {
+                    "target": target_endpoints.group(2).strip(),
+                    "origin": f"{item['origin']} scale endpoint",
+                    "source": endpoints.group(2),
+                },
+            )
+
+    for key, value in endpoint_additions.items():
+        additions.setdefault(key, value)
+    memory.update(additions)
+
+
 def build_translation_memory(doc_file):
     doc = Document(doc_file)
     memory = {}
@@ -189,6 +455,7 @@ def build_translation_memory(doc_file):
             text = clean_text(block.text)
             if text:
                 paragraph_run.append(text)
+                add_mixed_script_pairs_from_text(memory, text, "paragraph")
             continue
 
         for i in range(len(paragraph_run) - 1):
@@ -204,6 +471,7 @@ def build_translation_memory(doc_file):
         for row in block.rows:
             for cell in row.cells:
                 values = cell_lines(cell)
+                add_mixed_script_pairs_from_text(memory, cell.text, "table cell")
                 for i in range(0, len(values) - 1, 2):
                     add_translation_pair(memory, values[i], values[i + 1], "table cell")
 
@@ -211,6 +479,9 @@ def build_translation_memory(doc_file):
         if not looks_like_non_translation(paragraph_run[i + 1]):
             add_translation_pair(memory, paragraph_run[i], paragraph_run[i + 1], "paragraph")
 
+    add_derived_scale_pairs(memory)
+    add_mixed_script_pairs_from_docx_xml(memory, doc_file)
+    add_common_urdu_pairs(memory)
     return memory
 
 
@@ -225,24 +496,29 @@ def detect_default_column(columns, exact_name=None, contains=None):
 
 
 def find_translation(source_text, memory, use_fuzzy, threshold):
-    key = normalize(source_text)
-    if not key:
-        return "", "empty", 0
+    if has_protected_markup(source_text) and re.search(r"<br\s*/?>", str(source_text), flags=re.I):
+        translation, status, score = translate_composite_markup(
+            source_text,
+            memory,
+            use_fuzzy,
+            threshold,
+        )
+        if translation:
+            return translation, status, score
 
-    if key in memory:
-        return memory[key]["target"], "exact", 100
+    translation, status, score = translate_plain_text(
+        source_text,
+        memory,
+        use_fuzzy,
+        threshold,
+    )
+    if translation:
+        return translation, status, score
 
-    visible_source = clean_text(strip_sawtooth_markup(source_text), strip_html=True)
-    if re.fullmatch(r"[\d.]+|[A-Z]{3}", visible_source.strip()):
-        return visible_source.strip(), "copied", 100
+    if status == "empty":
+        return translation, status, score
 
-    if use_fuzzy and process and memory:
-        match = process.extractOne(key, memory.keys(), scorer=fuzz.ratio)
-        if match and match[1] >= threshold:
-            matched_key, score, _ = match
-            return memory[matched_key]["target"], "fuzzy", int(score)
-
-    return "", "unmatched", 0
+    return translate_composite_markup(source_text, memory, use_fuzzy, threshold)
 
 
 if uploaded_excel and uploaded_docx:
@@ -267,7 +543,7 @@ if uploaded_excel and uploaded_docx:
         target_index = columns.index(target_default) if target_default in columns else len(columns)
         target_choice = st.selectbox("Target column", target_options, index=target_index)
     with controls[3]:
-        fuzzy_threshold = st.slider("Fuzzy threshold", 90, 100, 97)
+        fuzzy_threshold = st.slider("Fuzzy threshold", 90, 100, 95)
 
     use_fuzzy = st.checkbox("Use high-confidence fuzzy matching", value=True)
     overwrite_existing = st.checkbox("Overwrite existing target values", value=True)
@@ -300,7 +576,10 @@ if uploaded_excel and uploaded_docx:
                 use_fuzzy,
                 fuzzy_threshold,
             )
-            translated_values.append(preserve_html_markup(row[source_col], translation))
+            if status in ("composite", "copied_markup"):
+                translated_values.append(translation)
+            else:
+                translated_values.append(preserve_html_markup(row[source_col], translation))
             statuses.append(status)
             scores.append(score if score else "")
 
@@ -316,7 +595,7 @@ if uploaded_excel and uploaded_docx:
             }
         )
 
-        matched = sum(status in ("exact", "fuzzy", "copied", "kept existing") for status in statuses)
+        matched = sum(status in ("exact", "fuzzy", "fuzzy_long", "copied", "copied_markup", "composite", "kept existing") for status in statuses)
         unmatched = sum(status == "unmatched" for status in statuses)
         empty_source = int((~source_nonblank).sum())
 
