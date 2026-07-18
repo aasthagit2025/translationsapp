@@ -282,6 +282,11 @@ def looks_like_non_translation(text):
             "TERMINATE ",
             "CONTINUE",
             "SECTION ",
+            "SCRIPTER ",
+            "SCRIPTER:",
+            "SCRIPTER INSTRUCTION",
+            "SCRIPTER INSTRUCTIONS",
+            "PLEASE SELECT",
         )
     ):
         return True
@@ -308,12 +313,14 @@ def cell_lines(cell):
     return lines
 
 
-def add_translation_pair(memory, source, target, origin):
+def add_translation_pair(memory, source, target, origin, trusted=False):
     source = strip_leading_conditions(source)
     target = clean_text(target)
     key = normalize(source)
 
     if not key or not target:
+        return
+    if looks_like_non_translation(target) and normalize(target) != key:
         return
 
     def comparable_target(value):
@@ -323,6 +330,20 @@ def add_translation_pair(memory, source, target, origin):
 
     existing = memory.get(key)
     if existing:
+        if trusted:
+            existing["target"] = target
+            existing["origin"] = origin
+            existing["source"] = source
+            existing["ambiguous"] = False
+            existing["trusted"] = True
+            existing["alternatives"] = sorted(set(existing.get("alternatives", []) + [target]))
+            return
+        if existing.get("trusted"):
+            if comparable_target(existing["target"]) != comparable_target(target):
+                existing["alternatives"] = sorted(
+                    set(existing.get("alternatives", [existing["target"]]) + [target])
+                )
+            return
         if comparable_target(existing["target"]) != comparable_target(target):
             existing["ambiguous"] = True
             existing["alternatives"] = sorted(
@@ -337,6 +358,7 @@ def add_translation_pair(memory, source, target, origin):
         "origin": origin,
         "source": source,
         "ambiguous": False,
+        "trusted": trusted,
         "alternatives": [target],
     }
 
@@ -443,7 +465,31 @@ def extract_following_urdu_target(tail):
         return ""
 
     target = clean_text(match.group(1))
+    target = re.sub(r"\s+_{2,}.*$", "", target).strip()
+    target = re.sub(r"\s+[A-Za-z][A-Za-z0-9'’&/().,\- ]{1,80}:\s+.*$", "", target).strip()
+    target = re.sub(r"\s+\d{1,3}$", "", target).strip()
     return target if contains_urdu(target) else ""
+
+
+def find_next_allowed_source_start(tail, source_values, current_source):
+    search_tail = tail[:320]
+    earliest = None
+    current_key = normalize(current_source)
+
+    for candidate in source_values:
+        candidate_text = clean_text(candidate, strip_html=True)
+        if len(candidate_text) < 2 or normalize(candidate_text) == current_key:
+            continue
+
+        candidate_words = re.findall(r"[A-Za-z0-9]+", candidate_text)
+        if not candidate_words:
+            continue
+
+        match = re.search(source_to_flexible_regex(candidate_text), search_tail, flags=re.I)
+        if match and match.start() > 0:
+            earliest = match.start() if earliest is None else min(earliest, match.start())
+
+    return earliest
 
 
 def add_allowed_source_pairs_from_text(memory, text, allowed_source_map, origin):
@@ -455,15 +501,36 @@ def add_allowed_source_pairs_from_text(memory, text, allowed_source_map, origin)
         key=lambda value: len(clean_text(value, strip_html=True)),
         reverse=True,
     )
+    next_source_patterns = []
+    for source in source_values:
+        clean_source = clean_text(source, strip_html=True)
+        source_words = re.findall(r"[A-Za-z0-9]+", clean_source)
+        if len(clean_source) >= 4 and source_words:
+            next_source_patterns.append(source_to_flexible_regex(clean_source))
+
+    next_source_regex = None
+    if next_source_patterns:
+        try:
+            next_source_regex = re.compile("|".join(next_source_patterns), flags=re.I)
+        except re.error:
+            next_source_regex = None
+
     for source in source_values:
         clean_source = clean_text(source, strip_html=True)
         if len(clean_source) < 2:
             continue
+        source_words = re.findall(r"[A-Za-z0-9]+", clean_source)
+        trusted_source = len(source_words) >= 2 and len(clean_source) >= 8
         pattern = source_to_flexible_regex(clean_source)
         for match in re.finditer(pattern, text, flags=re.I):
-            target = extract_following_urdu_target(text[match.end() :])
+            tail = text[match.end() :]
+            if next_source_regex:
+                next_match = next_source_regex.search(tail[:320])
+                if next_match and next_match.start() > 0:
+                    tail = tail[: next_match.start()]
+            target = extract_following_urdu_target(tail)
             if target:
-                add_translation_pair(memory, clean_source, target, origin)
+                add_translation_pair(memory, clean_source, target, origin, trusted=trusted_source)
                 break
 
 
@@ -472,15 +539,24 @@ def add_common_urdu_pairs(memory):
         return
 
     common_pairs = {
+        "Yes": "ہاں",
+        "No": "نہیں",
         "English": "انگریزی",
         "Urdu": "اردو",
         "Central Punjab": "وسطی پنجاب",
         "North": "شمال",
         "Sindh & Baluchistan": "سندھ اور بلوچستان",
         "South Punjab": "جنوبی پنجاب",
+        "Often": "اکثر اوقات",
+        "Rarely": "شاذ و نادر",
+        "Never": "کبھی نہیں",
+        "Year": "سال",
+        "Month": "مہینہ",
+        "Not appliable": "لاگو نہیں ہوتا",
+        "Not applicable": "لاگو نہیں ہوتا",
     }
     for source, target in common_pairs.items():
-        add_translation_pair(memory, source, target, "common Urdu fallback")
+        add_translation_pair(memory, source, target, "common Urdu fallback", trusted=True)
 
 
 def add_derived_scale_pairs(memory):
