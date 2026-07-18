@@ -158,6 +158,8 @@ def translate_plain_text(source_text, memory, use_fuzzy, threshold):
         return "", "empty", 0
 
     if key in memory:
+        if memory[key].get("ambiguous"):
+            return "", "ambiguous", 0
         return memory[key]["target"], "exact", 100
 
     visible_source = clean_text(strip_sawtooth_markup(source_text), strip_html=True)
@@ -171,6 +173,8 @@ def translate_plain_text(source_text, memory, use_fuzzy, threshold):
         match = process.extractOne(key, memory.keys(), scorer=fuzz.ratio)
         if match and match[1] >= threshold:
             matched_key, score, _ = match
+            if memory[matched_key].get("ambiguous"):
+                return "", "ambiguous", 0
             return memory[matched_key]["target"], "fuzzy", int(score)
         if (
             match
@@ -178,6 +182,8 @@ def translate_plain_text(source_text, memory, use_fuzzy, threshold):
             and match[1] >= 60
             and key[:35] == match[0][:35]
         ):
+            if memory[match[0]].get("ambiguous"):
+                return "", "ambiguous", 0
             return memory[match[0]]["target"], "fuzzy_long", int(match[1])
 
     return "", "unmatched", 0
@@ -310,19 +316,42 @@ def add_translation_pair(memory, source, target, origin):
     if not key or not target:
         return
 
-    memory.setdefault(key, {"target": target, "origin": origin, "source": source})
+    def comparable_target(value):
+        value = normalize(value)
+        value = re.sub(r"(?<=[\u0600-\u06FF])\s+(?=[\u0600-\u06FF])", "", value)
+        return value
+
+    existing = memory.get(key)
+    if existing:
+        if comparable_target(existing["target"]) != comparable_target(target):
+            existing["ambiguous"] = True
+            existing["alternatives"] = sorted(
+                set(existing.get("alternatives", [existing["target"]]) + [target])
+            )
+        elif len(target) < len(existing["target"]):
+            existing["target"] = target
+        return
+
+    memory[key] = {
+        "target": target,
+        "origin": origin,
+        "source": source,
+        "ambiguous": False,
+        "alternatives": [target],
+    }
 
 
 def contains_urdu(text):
     return bool(re.search(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]", str(text)))
 
 
-def add_mixed_script_pairs_from_text(memory, text, origin):
+def add_mixed_script_pairs_from_text(memory, text, origin, allowed_source_map=None):
     text = clean_text(text, strip_html=True)
     if not text or not contains_urdu(text):
         return
 
     urdu_block_pattern = re.compile(
+        r"(?:[\d\s,.-]+)?"
         r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]"
         r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\s،؛؟ءآأؤإئابپتٹثجچحخدڈذرڑزژسشصضطظعغفقکگلمنںوہھہیےَُِّْٰ]*"
     )
@@ -355,14 +384,29 @@ def add_mixed_script_pairs_from_text(memory, text, origin):
         }
         source_tokens = [token for token in source_tokens if token.lower() not in stopwords]
 
-        for length in range(1, min(10, len(source_tokens)) + 1):
+        candidates = []
+        prefix_key = normalize(prefix)
+        if allowed_source_map:
+            for allowed_key, allowed_source in allowed_source_map.items():
+                if len(allowed_key) < 2:
+                    continue
+                if prefix_key.endswith(allowed_key):
+                    candidates.append(allowed_source)
+
+        for length in range(1, min(14, len(source_tokens)) + 1):
             source = " ".join(source_tokens[-length:])
             if len(source) < 2:
                 continue
+            if allowed_source_map is not None and normalize(source) not in allowed_source_map:
+                continue
+            candidates.append(source)
+
+        if candidates:
+            source = max(candidates, key=lambda value: len(normalize(value)))
             add_translation_pair(memory, source, target, f"{origin} mixed script")
 
 
-def add_mixed_script_pairs_from_docx_xml(memory, doc_file):
+def add_mixed_script_pairs_from_docx_xml(memory, doc_file, allowed_source_map=None):
     try:
         with zipfile.ZipFile(doc_file) as package:
             xml_text = package.read("word/document.xml").decode("utf-8", "ignore")
@@ -372,7 +416,55 @@ def add_mixed_script_pairs_from_docx_xml(memory, doc_file):
     xml_text = re.sub(r"<[^>]+>", " ", xml_text)
     xml_text = html.unescape(xml_text)
     xml_text = clean_text(xml_text)
-    add_mixed_script_pairs_from_text(memory, xml_text, "docx xml")
+    add_mixed_script_pairs_from_text(memory, xml_text, "docx xml", allowed_source_map)
+    add_allowed_source_pairs_from_text(memory, xml_text, allowed_source_map, "docx xml exact source")
+
+
+def source_to_flexible_regex(source):
+    escaped = re.escape(clean_text(source, strip_html=True))
+    escaped = re.sub(r"\\\s+", r"\\s+", escaped)
+    escaped = escaped.replace("\\–", "[–—-]").replace("\\-", "[–—-]")
+    escaped = escaped.replace(",", r"\s*,\s*")
+    return escaped
+
+
+def extract_following_urdu_target(tail):
+    tail = tail[:260]
+    code_break = re.search(r"\s+\d{1,3}\s+(?=[A-Za-z])", tail)
+    if code_break:
+        tail = tail[: code_break.start()]
+
+    match = re.match(
+        r"\s*((?:[\d\s,.-]+)?[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]"
+        r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\d\s,.-،؛؟ءآأؤإئابپتٹثجچحخدڈذرڑزژسشصضطظعغفقکگلمنںوہھہیےَُِّْٰ]*)",
+        tail,
+    )
+    if not match:
+        return ""
+
+    target = clean_text(match.group(1))
+    return target if contains_urdu(target) else ""
+
+
+def add_allowed_source_pairs_from_text(memory, text, allowed_source_map, origin):
+    if not allowed_source_map or not contains_urdu(text):
+        return
+
+    source_values = sorted(
+        set(allowed_source_map.values()),
+        key=lambda value: len(clean_text(value, strip_html=True)),
+        reverse=True,
+    )
+    for source in source_values:
+        clean_source = clean_text(source, strip_html=True)
+        if len(clean_source) < 2:
+            continue
+        pattern = source_to_flexible_regex(clean_source)
+        for match in re.finditer(pattern, text, flags=re.I):
+            target = extract_following_urdu_target(text[match.end() :])
+            if target:
+                add_translation_pair(memory, clean_source, target, origin)
+                break
 
 
 def add_common_urdu_pairs(memory):
@@ -445,17 +537,24 @@ def add_derived_scale_pairs(memory):
     memory.update(additions)
 
 
-def build_translation_memory(doc_file):
+def build_translation_memory(doc_file, source_values=None):
     doc = Document(doc_file)
     memory = {}
     paragraph_run = []
+    allowed_source_map = None
+    if source_values is not None:
+        allowed_source_map = {
+            normalize(value): clean_text(value, strip_html=True)
+            for value in source_values
+            if clean_text(value, strip_html=True)
+        }
 
     for block in iter_doc_blocks(doc):
         if isinstance(block, Paragraph):
             text = clean_text(block.text)
             if text:
                 paragraph_run.append(text)
-                add_mixed_script_pairs_from_text(memory, text, "paragraph")
+                add_mixed_script_pairs_from_text(memory, text, "paragraph", allowed_source_map)
             continue
 
         for i in range(len(paragraph_run) - 1):
@@ -471,7 +570,7 @@ def build_translation_memory(doc_file):
         for row in block.rows:
             for cell in row.cells:
                 values = cell_lines(cell)
-                add_mixed_script_pairs_from_text(memory, cell.text, "table cell")
+                add_mixed_script_pairs_from_text(memory, cell.text, "table cell", allowed_source_map)
                 for i in range(0, len(values) - 1, 2):
                     add_translation_pair(memory, values[i], values[i + 1], "table cell")
 
@@ -480,7 +579,7 @@ def build_translation_memory(doc_file):
             add_translation_pair(memory, paragraph_run[i], paragraph_run[i + 1], "paragraph")
 
     add_derived_scale_pairs(memory)
-    add_mixed_script_pairs_from_docx_xml(memory, doc_file)
+    add_mixed_script_pairs_from_docx_xml(memory, doc_file, allowed_source_map)
     add_common_urdu_pairs(memory)
     return memory
 
@@ -545,12 +644,12 @@ if uploaded_excel and uploaded_docx:
     with controls[3]:
         fuzzy_threshold = st.slider("Fuzzy threshold", 90, 100, 95)
 
-    use_fuzzy = st.checkbox("Use high-confidence fuzzy matching", value=True)
+    use_fuzzy = st.checkbox("Use high-confidence fuzzy matching", value=False)
     overwrite_existing = st.checkbox("Overwrite existing target values", value=True)
 
     if st.button("Generate Translation File"):
         with st.spinner("Reading translated questionnaire..."):
-            memory = build_translation_memory(uploaded_docx)
+            memory = build_translation_memory(uploaded_docx, df[source_col])
 
         target_col = "Target" if target_choice == "Create new target column" else target_choice
         if target_col not in df.columns:
@@ -595,8 +694,9 @@ if uploaded_excel and uploaded_docx:
             }
         )
 
-        matched = sum(status in ("exact", "fuzzy", "fuzzy_long", "copied", "copied_markup", "composite", "kept existing") for status in statuses)
-        unmatched = sum(status == "unmatched" for status in statuses)
+        matched_statuses = ("exact", "fuzzy", "fuzzy_long", "copied", "copied_markup", "composite", "kept existing")
+        matched = sum(status in matched_statuses for status in statuses)
+        unmatched = sum(status not in matched_statuses and status != "empty" for status in statuses)
         empty_source = int((~source_nonblank).sum())
 
         st.success("Translation file generated.")
